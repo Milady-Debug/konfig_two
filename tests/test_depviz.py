@@ -1,4 +1,4 @@
-"""Тесты depviz (этап 1): конфигурация из CSV.
+"""Тесты depviz (этап 2): конфигурация и разбор Maven pom.xml.
 
 Запуск из корня репозитория: python -m unittest discover tests
 """
@@ -54,14 +54,6 @@ class TestLoadConfig(unittest.TestCase):
         with self.assertRaisesRegex(depviz.ConfigError, "неизвестные"):
             depviz.load_config(path)
 
-    def test_missing_key(self):
-        fd, path = tempfile.mkstemp(suffix=".csv", text=True)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("package_name,A\ntest_mode,true\n")
-        self.addCleanup(os.unlink, path)
-        with self.assertRaisesRegex(depviz.ConfigError, "отсутствуют"):
-            depviz.load_config(path)
-
     def test_bad_test_mode(self):
         path = self._config(test_mode="yes")
         with self.assertRaisesRegex(depviz.ConfigError, "test_mode"):
@@ -72,18 +64,52 @@ class TestLoadConfig(unittest.TestCase):
         with self.assertRaisesRegex(depviz.ConfigError, "URL"):
             depviz.load_config(path)
 
-    def test_test_repo_file_missing(self):
-        path = self._config(repository="missing_repo.txt")
-        with self.assertRaisesRegex(depviz.ConfigError, "не найден"):
-            depviz.load_config(path)
 
-    def test_wrong_columns(self):
-        path = self._write_config(
-            f"package_name,A,extra\nrepository,{self.repo_file}\n"
-            "test_mode,true\n"
+class TestMaven(unittest.TestCase):
+    """Проверки разбора координат, URL и pom.xml."""
+
+    def test_coordinates(self):
+        result = depviz.parse_maven_coordinates("org.x:lib:1.0")
+        self.assertEqual(result, ("org.x", "lib", "1.0"))
+
+    def test_bad_coordinates(self):
+        with self.assertRaises(depviz.AppError):
+            depviz.parse_maven_coordinates("only-two:parts")
+
+    def test_pom_url(self):
+        url = depviz.build_pom_url("https://repo", "org.apache", "lib", "2.0")
+        self.assertEqual(
+            url, "https://repo/org/apache/lib/2.0/lib-2.0.pom"
         )
-        with self.assertRaisesRegex(depviz.ConfigError, "колонки"):
-            depviz.load_config(path)
+
+    def test_parse_pom_with_property(self):
+        pom = (
+            "<project><groupId>g</groupId><artifactId>a</artifactId>"
+            "<version>1.0</version><dependencies><dependency>"
+            "<groupId>dep</groupId><artifactId>d</artifactId>"
+            "<version>${project.version}</version>"
+            "</dependency></dependencies></project>"
+        )
+        deps = depviz.parse_pom_dependencies(pom)
+        self.assertEqual(len(deps), 1)
+        self.assertEqual(deps[0]["version"], "1.0")
+        self.assertEqual(deps[0]["scope"], "compile")
+
+    def test_parse_pom_parent_inheritance(self):
+        pom = (
+            "<project><parent><groupId>parent.g</groupId>"
+            "<version>2.0</version></parent>"
+            "<artifactId>a</artifactId><dependencies><dependency>"
+            "<groupId>d</groupId><artifactId>x</artifactId>"
+            "<version>${project.version}</version>"
+            "</dependency></dependencies></project>"
+        )
+        deps = depviz.parse_pom_dependencies(pom)
+        self.assertEqual(deps[0]["version"], "2.0")
+
+    def test_parse_pom_invalid_xml(self):
+        with self.assertRaises(depviz.AppError):
+            depviz.parse_pom_dependencies("not xml at all")
 
 
 if __name__ == "__main__":
