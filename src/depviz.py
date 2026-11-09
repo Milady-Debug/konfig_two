@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """depviz — инструмент визуализации графа зависимостей менеджера пакетов.
 
-Вариант №13. Этап 2. Сбор данных.
+Вариант №13. Этап 3. Основные операции.
 
-Извлекает информацию о прямых зависимостях заданного пакета в формате
-Java (Maven): pom.xml загружается напрямую по URL-адресу репозитория и
-разбирается вручную средствами стандартной библиотеки. Менеджеры пакетов
-и сторонние библиотеки не используются.
-
-Прямые зависимости заданного пакета выводятся на экран.
+Строит граф зависимостей (с учётом транзитивности) алгоритмом DFS
+с рекурсией, корректно обрабатывает циклические зависимости.
+Поддерживается режим тестирования: вместо URL реального репозитория
+пользователь указывает путь к файлу описания графа репозитория,
+где пакеты называются большими латинскими буквами.
 """
 
 import argparse
@@ -29,6 +28,7 @@ MAVEN_PARTS = 3   # частей в координатах: groupId:artifactId:v
 HTTP_TIMEOUT = 15  # секунд на один HTTP-запрос
 
 _PROP_RE = re.compile(r"\$\{([^}]+)\}")
+_NAME_RE = re.compile(r"[A-Z]+")
 
 
 class ConfigError(Exception):
@@ -238,29 +238,170 @@ def parse_pom_dependencies(pom_text):
     return dependencies
 
 
-def get_direct_dependencies_maven(repository, package_name):
-    """Прямые зависимости пакета из Maven-репозитория по URL."""
-    group_id, artifact_id, version = parse_maven_coordinates(package_name)
-    url = build_pom_url(repository, group_id, artifact_id, version)
-    pom_text = fetch_text(url)
-    return parse_pom_dependencies(pom_text), url
+def maven_dependency_name(dep):
+    """Координаты зависимости в виде groupId:artifactId:version."""
+    return f"{dep['groupId']}:{dep['artifactId']}:{dep['version'] or '*'}"
+
+
+# ---------------------------------------------------------------------------
+# Тестовый репозиторий (этап 3)
+# ---------------------------------------------------------------------------
+
+def _check_name(name, path, lineno, what):
+    """Проверить, что имя состоит из больших латинских букв."""
+    if not _NAME_RE.fullmatch(name):
+        raise AppError(
+            f"{path}:{lineno}: {what} должно состоять из больших "
+            f"латинских букв, получено: «{name}»"
+        )
+
+
+def _parse_repo_line(repo, line, path, lineno):
+    """Разобрать строку тестового репозитория и записать в repo."""
+    if not line or line.startswith("#"):
+        return  # пустые строки и комментарии пропускаем
+    if ":" not in line:
+        raise AppError(
+            f"{path}:{lineno}: ожидался формат «ИМЯ: ЗАВ1 ЗАВ2 ...»"
+        )
+    name, _, deps_part = line.partition(":")
+    name = name.strip()
+    _check_name(name, path, lineno, "имя пакета")
+    if name in repo:
+        raise AppError(f"{path}:{lineno}: пакет «{name}» описан повторно")
+    deps = deps_part.split()
+    for dep in deps:
+        _check_name(dep, path, lineno, "имя зависимости")
+    repo[name] = deps
+
+
+def load_test_repository(path):
+    """Загрузить тестовый репозиторий из файла.
+
+    Формат строк: «ИМЯ: ЗАВ1 ЗАВ2 ...», пакеты называются большими
+    латинскими буквами; строки с «#» — комментарии.
+    """
+    repo = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for lineno, line in enumerate(f, start=1):
+                _parse_repo_line(repo, line.strip(), path, lineno)
+    except OSError as exc:
+        raise AppError(f"не удалось прочитать репозиторий {path}: {exc}")
+    if not repo:
+        raise AppError(f"тестовый репозиторий {path} пуст")
+    return repo
+
+
+# ---------------------------------------------------------------------------
+# Построение графа зависимостей: DFS с рекурсией (этап 3)
+# ---------------------------------------------------------------------------
+
+def build_graph_dfs(root, get_dependencies):
+    """Построить граф зависимостей (с транзитивностью): DFS с рекурсией.
+
+    get_dependencies(node) — функция, возвращающая список имён прямых
+    зависимостей узла; при AppError узел считается листом, сообщение
+    попадает в warnings. Возвращает (graph, cycles, warnings).
+    Циклы: обратное ребро фиксируется, обход по нему не продолжается.
+    """
+    graph = {}
+    cycles = []
+    warnings = []
+    state = {}  # узел -> "visiting" (в текущем пути) / "done" (обработан)
+    path = []   # текущий путь DFS от корня
+
+    def dfs(node):
+        state[node] = "visiting"
+        path.append(node)
+        try:
+            deps = get_dependencies(node)
+        except AppError as exc:
+            deps = []
+            warnings.append(str(exc))
+        graph[node] = deps
+        for dep in deps:
+            if state.get(dep) == "visiting":
+                # Обратное ребро — циклическая зависимость.
+                cycle = path[path.index(dep):] + [dep]
+                cycles.append(cycle)
+            elif state.get(dep) != "done":
+                dfs(dep)
+        path.pop()
+        state[node] = "done"
+
+    dfs(root)
+    return graph, cycles, warnings
+
+
+def print_graph(graph, cycles):
+    """Вывести граф зависимостей и найденные циклы."""
+    print("Граф зависимостей (с учётом транзитивности):")
+    for node in graph:
+        if graph[node]:
+            for dep in graph[node]:
+                print(f"  {node} -> {dep}")
+        else:
+            print(f"  {node} (зависимостей нет)")
+    print(f"Всего пакетов в графе: {len(graph)}")
+    if cycles:
+        print("Обнаружены циклические зависимости:")
+        for cycle in cycles:
+            print("  " + " -> ".join(cycle))
+    else:
+        print("Циклических зависимостей не обнаружено.")
 
 
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
-def format_dependency(dep):
-    """Строковое представление зависимости."""
-    version = dep["version"] or "*"
-    return (f"{dep['groupId']}:{dep['artifactId']}:{version} "
-            f"(scope: {dep['scope']})")
+def _test_getter(config):
+    """Функция зависимостей для тестового репозитория."""
+    repo = load_test_repository(config["repository"])
+    name = config["package_name"]
+    if not _NAME_RE.fullmatch(name):
+        raise AppError(
+            f"в тестовом режиме имя пакета должно состоять из больших "
+            f"латинских букв, получено: «{name}»"
+        )
+
+    def get_dependencies(node):
+        if node not in repo:
+            raise AppError(
+                f"пакет «{node}» отсутствует в тестовом репозитории"
+            )
+        return repo[node]
+
+    return get_dependencies
+
+
+def _maven_getter(config):
+    """Функция зависимостей для реального Maven-репозитория."""
+    repository = config["repository"]
+    parse_maven_coordinates(config["package_name"])  # проверка корня
+
+    def get_dependencies(node):
+        group_id, artifact_id, version = parse_maven_coordinates(node)
+        url = build_pom_url(repository, group_id, artifact_id, version)
+        pom_text = fetch_text(url)
+        deps = parse_pom_dependencies(pom_text)
+        return [maven_dependency_name(dep) for dep in deps]
+
+    return get_dependencies
+
+
+def _make_dependency_getter(config):
+    """Создать функцию получения зависимостей по режиму работы."""
+    if config["test_mode"]:
+        return _test_getter(config)
+    return _maven_getter(config)
 
 
 def main(argv=None):
-    """Точка входа: конфигурация, загрузка pom, вывод зависимостей."""
+    """Точка входа: конфигурация, построение графа, вывод."""
     parser = argparse.ArgumentParser(
-        description="depviz: визуализация графа зависимостей (этап 2)"
+        description="depviz: визуализация графа зависимостей (этап 3)"
     )
     parser.add_argument(
         "--config",
@@ -270,19 +411,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-        dependencies, url = get_direct_dependencies_maven(
-            config["repository"], config["package_name"]
+        get_dependencies = _make_dependency_getter(config)
+        graph, cycles, warnings = build_graph_dfs(
+            config["package_name"], get_dependencies
         )
-        print(f"POM загружен: {url}")
     except (ConfigError, AppError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
-    # Требование этапа 2: вывести все прямые зависимости пакета.
-    print(f"Прямые зависимости пакета {config['package_name']}:")
-    if not dependencies:
-        print("  (прямых зависимостей нет)")
-    for dep in dependencies:
-        print(f"  {format_dependency(dep)}")
+    for warning in warnings:
+        print(f"Предупреждение: {warning}", file=sys.stderr)
+    print_graph(graph, cycles)
     return 0
 
 
